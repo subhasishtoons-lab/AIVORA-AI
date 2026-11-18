@@ -1,0 +1,8 @@
+{
+  "name": "AIVORA AI",
+  "description": "Discover the Future of Artificial Intelligence. Curated AI tools directory, side-by-side comparisons, verified links, and editorial guides.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
