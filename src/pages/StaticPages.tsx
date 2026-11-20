@@ -157,7 +157,7 @@ export function ContactPage() {
               <Mail className="mt-0.5 h-5 w-5 text-indigo-600 dark:text-indigo-400" aria-hidden="true" />
               <div>
                 <p className="font-semibold text-slate-900 dark:text-white">Editorial Desk</p>
-                <p>editorial@aivora-ai.example</p>
+                <p>editorial@aivoraai.publicvm.com</p>
               </div>
             </div>
             <div className="flex items-start gap-3">
