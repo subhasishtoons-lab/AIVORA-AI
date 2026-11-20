@@ -40,7 +40,6 @@ import {
 } from '../utils/directory';
 
 export type ThemeMode = 'light' | 'dark';
-
 export type AuthModalMode = 'login' | 'signup' | 'reset' | 'update-password' | null;
 
 export interface ToastMessage {
@@ -100,7 +99,6 @@ interface DirectoryContextValue {
   clearCompare: () => void;
   isCompareModalOpen: boolean;
   setCompareModalOpen: (open: boolean) => void;
-  // Real Supabase Authentication & User Profile state
   authModalMode: AuthModalMode;
   openAuthModal: (mode: Exclude<AuthModalMode, null>) => void;
   closeAuthModal: () => void;
@@ -118,14 +116,14 @@ interface DirectoryContextValue {
   requestPasswordReset: (email: string) => Promise<string | null>;
   updatePassword: (newPassword: string) => Promise<string | null>;
   signOutUser: () => Promise<void>;
-  updateUserProfile: (patch: Partial<Pick<UserProfile, 'fullName' | 'company' | 'bio'>>) => Promise<string | null>;
-  // Modals & Toasts
+  updateUserProfile: (
+    patch: Partial<Pick<UserProfile, 'fullName' | 'company' | 'bio'>>
+  ) => Promise<string | null>;
   isSubmitModalOpen: boolean;
   setSubmitModalOpen: (open: boolean) => void;
   toasts: ToastMessage[];
   pushToast: (text: string, tone?: 'success' | 'info' | 'error') => void;
   dismissToast: (id: string) => void;
-  // User Actions
   toggleFavorite: (toolId: string) => Promise<void>;
   recordToolView: (tool: AITool) => void;
   trackSearchQuery: (keyword: string) => void;
@@ -140,7 +138,6 @@ interface DirectoryContextValue {
     input: Omit<AdvertisingInquiry, 'id' | 'status' | 'createdAt'>
   ) => Promise<string | null>;
   subscribeNewsletter: (email: string) => Promise<boolean>;
-  // Admin Operations (backed by JWT-verified /api/admin/* endpoints)
   supabaseToolsCount: number | null;
   syncStarterToolsToSupabase: () => Promise<boolean>;
   refreshAdminData: () => Promise<string | null>;
@@ -190,15 +187,72 @@ function sendAnalyticsEvent(payload: {
   category?: string;
   keyword?: string;
 }) {
-  if (typeof window === 'undefined') return;
+  if (typeof window === 'undefined' || !isSupabaseClientConfigured || !supabase) return;
   const sessionHash = getOrCreateVisitorSessionHash();
-  fetch('/api/analytics/event', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ ...payload, sessionHash }),
-  }).catch(() => {
-    // Analytics ingestion must never disrupt UX
-  });
+  supabase
+    .from('analytics_events')
+    .insert({
+      event_type: payload.eventType,
+      session_hash: sessionHash,
+      path: payload.path || window.location.pathname,
+      tool_id: payload.toolId || null,
+      tool_slug: payload.toolSlug || null,
+      category: payload.category || null,
+      keyword: payload.keyword || null,
+    })
+    .then(() => {})
+    .catch(() => {});
+}
+
+function serializeToolForSupabase(tool: AITool): Record<string, unknown> {
+  return {
+    id: tool.id,
+    slug: tool.slug,
+    name: tool.name,
+    tagline: tool.tagline || '',
+    short_description: tool.shortDescription || '',
+    description: tool.description || '',
+    category: tool.category,
+    pricing: tool.pricing,
+    pricing_summary: tool.pricingSummary || '',
+    pricing_tiers: tool.pricingTiers || [],
+    pricing_snapshot_date: tool.pricingSnapshotDate || '',
+    website_url: tool.websiteUrl,
+    affiliate_url: tool.affiliateUrl || null,
+    affiliate_program: tool.affiliateProgram || null,
+    affiliate_tracking_id: tool.affiliateTrackingId || null,
+    listing_tier: tool.listingTier || 'Free',
+    sponsor_tagline: tool.sponsorTagline || null,
+    campaign_start: tool.campaignStart || null,
+    campaign_end: tool.campaignEnd || null,
+    campaign_duration_days: tool.campaignDurationDays ?? null,
+    sponsor_status: tool.sponsorStatus || 'none',
+    logo_color: tool.logoColor || '#4F46E5',
+    logo_text_color: tool.logoTextColor || null,
+    logo_key: tool.logoKey || '',
+    logo_url: tool.logoUrl || null,
+    features: tool.features || [],
+    pros: tool.pros || [],
+    cons: tool.cons || [],
+    best_use_cases: tool.bestUseCases || [],
+    rating: tool.rating ?? 0,
+    review_count: tool.reviewCount ?? 0,
+    is_featured: Boolean(tool.isFeatured),
+    is_trending: Boolean(tool.isTrending),
+    status: tool.status === 'draft' ? 'draft' : 'published',
+    added_at: tool.addedAt || new Date().toISOString().slice(0, 10),
+    tags: tool.tags || [],
+  };
+}
+
+async function checkSupabaseSchemaReady(): Promise<boolean> {
+  if (!isSupabaseClientConfigured || !supabase) return false;
+  try {
+    const { error } = await supabase.from('categories').select('id').limit(1);
+    return !error;
+  } catch {
+    return false;
+  }
 }
 
 export function DirectoryProvider({ children }: { children: React.ReactNode }) {
@@ -226,7 +280,7 @@ export function DirectoryProvider({ children }: { children: React.ReactNode }) {
     supabaseSchemaReady: false,
     siteUrl:
       (import.meta.env.VITE_SITE_URL as string | undefined)?.trim() ||
-      (typeof window !== 'undefined' ? window.location.origin : 'http://localhost:3000'),
+      (typeof window !== 'undefined' ? window.location.origin : 'https://www.aivoraai.publicvm.com'),
   });
 
   const [theme, setTheme] = useState<ThemeMode>(() => {
@@ -240,7 +294,6 @@ export function DirectoryProvider({ children }: { children: React.ReactNode }) {
   const [compareIds, setCompareIds] = useState<string[]>([]);
   const [isCompareModalOpen, setCompareModalOpen] = useState(false);
 
-  // Supabase Auth State
   const [authModalMode, setAuthModalMode] = useState<AuthModalMode>(null);
   const [authLoading, setAuthLoading] = useState(Boolean(isSupabaseClientConfigured));
   const [currentUser, setCurrentUser] = useState<UserProfile | null>(null);
@@ -272,16 +325,13 @@ export function DirectoryProvider({ children }: { children: React.ReactNode }) {
     setDirectoryError(null);
     setIsLoading(true);
     try {
-      try {
-        const cfgRes = await fetch('/api/config/status');
-        if (cfgRes.ok) {
-          const cfg = (await cfgRes.json()) as IntegrationConfigStatus;
-          setSupabaseSchemaReady(Boolean(cfg.supabaseSchemaReady));
-          setConfigStatus(cfg);
-        }
-      } catch {
-        setSupabaseSchemaReady(false);
-      }
+      const schemaOk = await checkSupabaseSchemaReady();
+      setSupabaseSchemaReady(schemaOk);
+      setConfigStatus((prev) => ({
+        ...prev,
+        supabaseClientConfigured: isSupabaseClientConfigured,
+        supabaseSchemaReady: schemaOk,
+      }));
 
       const [
         loadedTools,
@@ -303,37 +353,33 @@ export function DirectoryProvider({ children }: { children: React.ReactNode }) {
         directoryRepository.getSubscribers(),
       ]);
 
-      setTools(loadedTools);
-      setCategories(loadedCategories);
-      setBlogPosts(loadedPosts);
-      setReviews(loadedReviews);
-      setFavorites(loadedFavorites);
-      setRecentlyViewedIds(loadedRecent);
-      setSubmissions(loadedSubmissions);
-      setSubscribers(loadedSubscribers);
+      setTools(loadedTools || INITIAL_TOOLS);
+      setCategories(loadedCategories || INITIAL_CATEGORIES);
+      setBlogPosts(loadedPosts || INITIAL_BLOG_POSTS);
+      setReviews(loadedReviews || INITIAL_REVIEWS);
+      setFavorites(loadedFavorites || []);
+      setRecentlyViewedIds(loadedRecent || []);
+      setSubmissions(loadedSubmissions || []);
+      setSubscribers(loadedSubscribers || []);
     } catch {
-      setDirectoryError(
-        'Could not refresh live directory records. Showing local catalog defaults.'
-      );
+      setDirectoryError('Could not refresh live directory records. Showing local catalog defaults.');
     } finally {
       setIsLoading(false);
     }
   }, []);
 
-  // Load live directory data & server config flags silently on top of initial seed
   useEffect(() => {
     let active = true;
     async function hydrate() {
       try {
-        try {
-          const cfgRes = await fetch('/api/config/status');
-          if (cfgRes.ok && active) {
-            const cfg = (await cfgRes.json()) as IntegrationConfigStatus;
-            setSupabaseSchemaReady(Boolean(cfg.supabaseSchemaReady));
-            setConfigStatus(cfg);
-          }
-        } catch {
-          setSupabaseSchemaReady(false);
+        const schemaOk = await checkSupabaseSchemaReady();
+        if (active) {
+          setSupabaseSchemaReady(schemaOk);
+          setConfigStatus((prev) => ({
+            ...prev,
+            supabaseClientConfigured: isSupabaseClientConfigured,
+            supabaseSchemaReady: schemaOk,
+          }));
         }
 
         const [
@@ -357,19 +403,17 @@ export function DirectoryProvider({ children }: { children: React.ReactNode }) {
         ]);
 
         if (!active) return;
-        setTools(loadedTools);
-        setCategories(loadedCategories);
-        setBlogPosts(loadedPosts);
-        setReviews(loadedReviews);
-        setFavorites(loadedFavorites);
-        setRecentlyViewedIds(loadedRecent);
-        setSubmissions(loadedSubmissions);
-        setSubscribers(loadedSubscribers);
+        setTools(loadedTools || INITIAL_TOOLS);
+        setCategories(loadedCategories || INITIAL_CATEGORIES);
+        setBlogPosts(loadedPosts || INITIAL_BLOG_POSTS);
+        setReviews(loadedReviews || INITIAL_REVIEWS);
+        setFavorites(loadedFavorites || []);
+        setRecentlyViewedIds(loadedRecent || []);
+        setSubmissions(loadedSubmissions || []);
+        setSubscribers(loadedSubscribers || []);
       } catch {
         if (active) {
-          setDirectoryError(
-            'Unable to reach the live database. Showing local directory defaults.'
-          );
+          setDirectoryError('Unable to reach the live database. Showing local directory defaults.');
         }
       } finally {
         if (active) setIsLoading(false);
@@ -381,7 +425,6 @@ export function DirectoryProvider({ children }: { children: React.ReactNode }) {
     };
   }, []);
 
-  // Sync Supabase Auth session & user profile
   useEffect(() => {
     if (!isSupabaseClientConfigured || !supabase) {
       setAuthLoading(false);
@@ -409,14 +452,13 @@ export function DirectoryProvider({ children }: { children: React.ReactNode }) {
         }
       );
 
-      // Sync user-specific favorites & recently viewed tools from Supabase
       const [userFavs, userRecent] = await Promise.all([
         directoryRepository.getFavorites(userId),
         directoryRepository.getRecentlyViewed(userId),
       ]);
       if (!active) return;
-      setFavorites(userFavs);
-      setRecentlyViewedIds(userRecent);
+      setFavorites(userFavs || []);
+      setRecentlyViewedIds(userRecent || []);
       setAuthLoading(false);
     };
 
@@ -447,7 +489,6 @@ export function DirectoryProvider({ children }: { children: React.ReactNode }) {
     return () => window.removeEventListener('popstate', onPopState);
   }, []);
 
-  // Track real page views when path changes
   useEffect(() => {
     if (lastTrackedPathRef.current === loc.path) return;
     lastTrackedPathRef.current = loc.path;
@@ -526,19 +567,16 @@ export function DirectoryProvider({ children }: { children: React.ReactNode }) {
         document.documentElement.classList.toggle('dark', next === 'dark');
         try {
           window.localStorage.setItem('aivora_theme', next);
-        } catch {
-          // ignore
-        }
+        } catch {}
       }
       return next;
     });
   }, []);
 
-  // Auth Actions (Real Supabase Auth only — no fake password acceptance)
   const signInWithPassword = useCallback(
     async (email: string, password: string): Promise<string | null> => {
       if (!isSupabaseClientConfigured || !supabase) {
-        return 'Supabase Auth is not configured yet. Add VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY to your environment variables.';
+        return 'Supabase Auth is not configured.';
       }
       const { error } = await supabase.auth.signInWithPassword({
         email: email.trim(),
@@ -559,17 +597,12 @@ export function DirectoryProvider({ children }: { children: React.ReactNode }) {
       fullName: string
     ): Promise<{ error: string | null; needsEmailConfirm?: boolean }> => {
       if (!isSupabaseClientConfigured || !supabase) {
-        return {
-          error:
-            'Supabase Auth is not configured yet. Add VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY to enable user registration.',
-        };
+        return { error: 'Supabase Auth is not configured.' };
       }
       const { data, error } = await supabase.auth.signUp({
         email: email.trim(),
         password,
-        options: {
-          data: { full_name: fullName.trim() },
-        },
+        options: { data: { full_name: fullName.trim() } },
       });
       if (error) return { error: error.message };
 
@@ -585,23 +618,15 @@ export function DirectoryProvider({ children }: { children: React.ReactNode }) {
   );
 
   const requestPasswordReset = useCallback(async (email: string): Promise<string | null> => {
-    if (!isSupabaseClientConfigured || !supabase) {
-      return 'Password reset requires Supabase Auth to be configured.';
-    }
-    const redirectTo =
-      typeof window !== 'undefined' ? `${window.location.origin}/dashboard` : undefined;
-    const { error } = await supabase.auth.resetPasswordForEmail(email.trim(), {
-      redirectTo,
-    });
-    if (error) return error.message;
-    return null;
+    if (!isSupabaseClientConfigured || !supabase) return 'Password reset requires Supabase Auth.';
+    const redirectTo = typeof window !== 'undefined' ? `${window.location.origin}/dashboard` : undefined;
+    const { error } = await supabase.auth.resetPasswordForEmail(email.trim(), { redirectTo });
+    return error ? error.message : null;
   }, []);
 
   const updatePassword = useCallback(
     async (newPassword: string): Promise<string | null> => {
-      if (!isSupabaseClientConfigured || !supabase) {
-        return 'Supabase Auth is not configured.';
-      }
+      if (!isSupabaseClientConfigured || !supabase) return 'Supabase Auth is not configured.';
       const { error } = await supabase.auth.updateUser({ password: newPassword });
       if (error) return error.message;
       pushToast('Password updated successfully.', 'success');
@@ -668,9 +693,7 @@ export function DirectoryProvider({ children }: { children: React.ReactNode }) {
   const toggleFavorite = useCallback(
     async (toolId: string) => {
       const exists = favorites.includes(toolId);
-      const updated = exists
-        ? favorites.filter((id) => id !== toolId)
-        : [...favorites, toolId];
+      const updated = exists ? favorites.filter((id) => id !== toolId) : [...favorites, toolId];
       setFavorites(updated);
       await directoryRepository.saveFavorites(updated, currentUser?.id);
       pushToast(
@@ -707,11 +730,7 @@ export function DirectoryProvider({ children }: { children: React.ReactNode }) {
     const clean = keyword.trim().toLowerCase();
     if (clean.length < 2 || lastTrackedSearchRef.current === clean) return;
     lastTrackedSearchRef.current = clean;
-    sendAnalyticsEvent({
-      eventType: 'search',
-      path: '/explore',
-      keyword: clean,
-    });
+    sendAnalyticsEvent({ eventType: 'search', path: '/explore', keyword: clean });
   }, []);
 
   const submitReview = useCallback(
@@ -744,64 +763,67 @@ export function DirectoryProvider({ children }: { children: React.ReactNode }) {
         };
       }
 
-      try {
-        const res = await fetch('/api/submissions', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(proposal),
+      const id = `sub-${Date.now()}`;
+      const submittedAt = new Date().toISOString().slice(0, 10);
+      const requiresAdminApproval = Boolean(
+        proposal.requestedTier && proposal.requestedTier !== 'Free'
+      );
+
+      if (isSupabaseClientConfigured && supabase) {
+        const { error } = await supabase.from('tool_submissions').insert({
+          id,
+          name: proposal.name,
+          website_url: proposal.websiteUrl,
+          category: proposal.category,
+          pricing: proposal.pricing,
+          short_description: proposal.shortDescription,
+          submitter_email: proposal.submitterEmail,
+          requested_tier: proposal.requestedTier || 'Free',
+          campaign_duration_days: proposal.campaignDurationDays ?? null,
+          status: 'pending',
+          submitted_at: submittedAt,
         });
-        const data = await res.json();
-        if (!res.ok) {
-          return {
-            requiresAdminApproval: false,
-            error: data.error || 'Submission failed validation.',
-          };
-        }
-
-        const entry = data.submission as ToolSubmission;
-        const updated = [entry, ...submissions];
-        setSubmissions(updated);
-        await directoryRepository.saveSubmissions(updated);
-
-        if (data.sponsoredRequest) {
-          setSponsoredListings((prev) => [
-            data.sponsoredRequest as SponsoredListingRequest,
-            ...prev,
-          ]);
-        }
-
-        pushToast(
-          data.requiresAdminApproval
-            ? 'Listing submitted — pending Administrator approval before publishing.'
-            : 'Tool submitted for editorial review.',
-          'success'
-        );
-        return { requiresAdminApproval: Boolean(data.requiresAdminApproval), error: null };
-      } catch {
-        return { requiresAdminApproval: false, error: 'Network error submitting tool.' };
+        if (error) return { requiresAdminApproval: false, error: error.message };
       }
+
+      const entry: ToolSubmission = {
+        ...proposal,
+        id,
+        status: 'pending',
+        submittedAt,
+      };
+      const updated = [entry, ...submissions];
+      setSubmissions(updated);
+      await directoryRepository.saveSubmissions(updated);
+      pushToast(
+        requiresAdminApproval
+          ? 'Listing submitted — pending Administrator approval before publishing.'
+          : 'Tool submitted for editorial review.',
+        'success'
+      );
+      return { requiresAdminApproval, error: null };
     },
-    [submissions, pushToast]
+    [tools, submissions, pushToast]
   );
 
   const submitContactInquiry = useCallback(
     async (
       input: Omit<ContactInquiry, 'id' | 'status' | 'createdAt'>
     ): Promise<string | null> => {
-      try {
-        const res = await fetch('/api/contact', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(input),
+      if (isSupabaseClientConfigured && supabase) {
+        const id = `inq-${Date.now()}`;
+        const { error } = await supabase.from('contact_inquiries').insert({
+          id,
+          name: input.name,
+          email: input.email,
+          subject: input.subject,
+          message: input.message,
+          status: 'new',
         });
-        const data = await res.json();
-        if (!res.ok) return data.error || 'Failed to send message.';
-        setContactInquiries((prev) => [data.inquiry as ContactInquiry, ...prev]);
-        pushToast('Inquiry received by the AIVORA AI team.', 'success');
-        return null;
-      } catch {
-        return 'Network error while submitting your message.';
+        if (error) return error.message;
       }
+      pushToast('Inquiry received by the AIVORA AI team.', 'success');
+      return null;
     },
     [pushToast]
   );
@@ -810,138 +832,270 @@ export function DirectoryProvider({ children }: { children: React.ReactNode }) {
     async (
       input: Omit<AdvertisingInquiry, 'id' | 'status' | 'createdAt'>
     ): Promise<string | null> => {
-      try {
-        const res = await fetch('/api/advertising', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(input),
+      if (isSupabaseClientConfigured && supabase) {
+        const id = `adv-${Date.now()}`;
+        const { error } = await supabase.from('advertising_inquiries').insert({
+          id,
+          company_name: input.companyName,
+          contact_name: input.contactName,
+          email: input.email,
+          website_url: input.websiteUrl,
+          package_interest: input.packageInterest,
+          budget_range: input.budgetRange,
+          goals: input.goals,
+          status: 'new',
         });
-        const data = await res.json();
-        if (!res.ok) return data.error || 'Failed to submit advertising enquiry.';
-        setAdvertisingInquiries((prev) => [data.inquiry as AdvertisingInquiry, ...prev]);
-        pushToast('Advertising enquiry submitted for review.', 'success');
-        return null;
-      } catch {
-        return 'Network error while submitting advertising enquiry.';
+        if (error) return error.message;
       }
+      pushToast('Advertising enquiry submitted for review.', 'success');
+      return null;
     },
     [pushToast]
   );
 
   const subscribeNewsletter = useCallback(
     async (email: string) => {
-      const exists = subscribers.some(
-        (s) => s.email.toLowerCase() === email.trim().toLowerCase()
-      );
-      if (exists) {
+      const cleanEmail = email.trim().toLowerCase();
+      if (subscribers.some((s) => s.email.toLowerCase() === cleanEmail)) {
         pushToast('This email is already subscribed to the weekly digest.', 'info');
         return false;
       }
-      try {
-        const res = await fetch('/api/newsletter', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ email: email.trim() }),
+      const sub: NewsletterSubscriber = {
+        id: `nl-${Date.now()}`,
+        email: cleanEmail,
+        subscribedAt: new Date().toISOString().slice(0, 10),
+      };
+      if (isSupabaseClientConfigured && supabase) {
+        const { error } = await supabase.from('newsletter_subscribers').insert({
+          id: sub.id,
+          email: sub.email,
+          subscribed_at: sub.subscribedAt,
         });
-        const data = await res.json();
-        if (!res.ok) {
-          pushToast(data.error || 'Subscription failed.', 'error');
+        if (error && !error.message.toLowerCase().includes('duplicate')) {
+          pushToast(error.message, 'error');
           return false;
         }
-        const sub = data.subscriber as NewsletterSubscriber;
-        const updated = await directoryRepository.addSubscriber(sub);
-        setSubscribers(updated);
-        sendAnalyticsEvent({ eventType: 'newsletter_signup', path: loc.path });
-        pushToast('Subscribed to the AIVORA AI weekly briefing.', 'success');
-        return true;
-      } catch {
-        pushToast('Unable to subscribe right now.', 'error');
-        return false;
       }
+      const updated = await directoryRepository.addSubscriber(sub);
+      setSubscribers(updated);
+      sendAnalyticsEvent({ eventType: 'newsletter_signup', path: loc.path });
+      pushToast('Subscribed to the AIVORA AI weekly briefing.', 'success');
+      return true;
     },
     [subscribers, loc.path, pushToast]
   );
 
-  // Admin API Helper — strictly authenticated via Bearer token on server
-  const adminFetch = useCallback(
-    async (url: string, init?: RequestInit) => {
-      const headers: Record<string, string> = {
-        'Content-Type': 'application/json',
-        ...(init?.headers as Record<string, string> | undefined),
-      };
-      if (accessToken) {
-        headers.Authorization = `Bearer ${accessToken}`;
-      }
-      const res = await fetch(url, { ...init, headers });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        const msg =
-          (data as { error?: string }).error ||
-          `Admin API denied request (${res.status}).`;
-        setAdminError(msg);
-        pushToast(msg, 'error');
-        return { ok: false as const, status: res.status, data };
-      }
-      setAdminError(null);
-      return { ok: true as const, status: res.status, data };
-    },
-    [accessToken, pushToast]
-  );
-
   const refreshAdminData = useCallback(async (): Promise<string | null> => {
-    const result = await adminFetch('/api/admin/overview');
-    if (!result.ok) {
-      return (result.data as { error?: string }).error || 'Admin access denied.';
+    if (!isSupabaseClientConfigured || !supabase) {
+      return 'Supabase is not configured.';
     }
-    const payload = result.data as {
-      tools?: AITool[];
-      supabaseToolsCount?: number;
-      analytics: AnalyticsSummary;
-      affiliateClicks: AffiliateClickRecord[];
-      sponsoredListings: SponsoredListingRequest[];
-      submissions: ToolSubmission[];
-      subscribers: NewsletterSubscriber[];
-      contactInquiries: ContactInquiry[];
-      advertisingInquiries: AdvertisingInquiry[];
-      users: UserProfile[];
-    };
-    const dbToolCount =
-      typeof payload.supabaseToolsCount === 'number'
-        ? payload.supabaseToolsCount
-        : (payload.tools?.length ?? 0);
-    setSupabaseToolsCount(dbToolCount);
-    if (Array.isArray(payload.tools) && payload.tools.length > 0) {
-      setTools(payload.tools);
-      await directoryRepository.saveTools(payload.tools);
+    try {
+      const [
+        toolsRes,
+        subsRes,
+        sponsoredRes,
+        nlRes,
+        contactRes,
+        advRes,
+        clicksRes,
+        profilesRes,
+        eventsRes,
+      ] = await Promise.all([
+        supabase.from('ai_tools').select('id', { count: 'exact', head: true }),
+        supabase.from('tool_submissions').select('*').order('submitted_at', { ascending: false }),
+        supabase.from('sponsored_listings').select('*').order('created_at', { ascending: false }),
+        supabase.from('newsletter_subscribers').select('*').order('subscribed_at', { ascending: false }),
+        supabase.from('contact_inquiries').select('*').order('created_at', { ascending: false }),
+        supabase.from('advertising_inquiries').select('*').order('created_at', { ascending: false }),
+        supabase.from('affiliate_clicks').select('*').order('clicked_at', { ascending: false }).limit(100),
+        supabase.from('profiles').select('*').order('created_at', { ascending: false }),
+        supabase.from('analytics_events').select('*').limit(500),
+      ]);
+
+      setSupabaseToolsCount(toolsRes.count ?? 0);
+
+      if (subsRes.data) {
+        setSubmissions(
+          subsRes.data.map((r: Record<string, unknown>) => ({
+            id: String(r.id),
+            name: String(r.name),
+            websiteUrl: String(r.website_url),
+            category: String(r.category),
+            pricing: (r.pricing as AITool['pricing']) || 'Freemium',
+            shortDescription: String(r.short_description || ''),
+            submitterEmail: String(r.submitter_email || ''),
+            requestedTier: (r.requested_tier as AITool['listingTier']) || 'Free',
+            campaignDurationDays:
+              typeof r.campaign_duration_days === 'number' ? r.campaign_duration_days : undefined,
+            status: (r.status as ToolSubmission['status']) || 'pending',
+            submittedAt: String(r.submitted_at || ''),
+          }))
+        );
+      }
+
+      if (sponsoredRes.data) {
+        setSponsoredListings(
+          sponsoredRes.data.map((r: Record<string, unknown>) => ({
+            id: String(r.id),
+            toolId: r.tool_id ? String(r.tool_id) : undefined,
+            toolName: String(r.tool_name),
+            websiteUrl: String(r.website_url),
+            contactEmail: String(r.contact_email),
+            tier: (r.tier as SponsoredListingRequest['tier']) || 'Featured',
+            durationDays: Number(r.duration_days || 30),
+            sponsorTagline: String(r.sponsor_tagline || ''),
+            status: (r.status as SponsoredListingRequest['status']) || 'pending',
+            adminNotes: r.admin_notes ? String(r.admin_notes) : undefined,
+            createdAt: String(r.created_at || ''),
+          }))
+        );
+      }
+
+      if (nlRes.data) {
+        setSubscribers(
+          nlRes.data.map((r: Record<string, unknown>) => ({
+            id: String(r.id),
+            email: String(r.email),
+            subscribedAt: String(r.subscribed_at || ''),
+          }))
+        );
+      }
+
+      if (contactRes.data) {
+        setContactInquiries(
+          contactRes.data.map((r: Record<string, unknown>) => ({
+            id: String(r.id),
+            name: String(r.name),
+            email: String(r.email),
+            subject: String(r.subject),
+            message: String(r.message),
+            status: (r.status as ContactInquiry['status']) || 'new',
+            createdAt: String(r.created_at || ''),
+          }))
+        );
+      }
+
+      if (advRes.data) {
+        setAdvertisingInquiries(
+          advRes.data.map((r: Record<string, unknown>) => ({
+            id: String(r.id),
+            companyName: String(r.company_name),
+            contactName: String(r.contact_name),
+            email: String(r.email),
+            websiteUrl: String(r.website_url),
+            packageInterest: String(r.package_interest),
+            budgetRange: String(r.budget_range),
+            goals: String(r.goals),
+            status: (r.status as AdvertisingInquiry['status']) || 'new',
+            createdAt: String(r.created_at || ''),
+          }))
+        );
+      }
+
+      const mappedClicks: AffiliateClickRecord[] = (clicksRes.data || []).map(
+        (r: Record<string, unknown>) => ({
+          id: String(r.id),
+          toolId: String(r.tool_id),
+          toolSlug: String(r.tool_slug),
+          toolName: String(r.tool_name),
+          destinationUrl: String(r.destination_url),
+          sourcePage: String(r.source_page || '/'),
+          clickedAt: String(r.clicked_at || ''),
+        })
+      );
+      setAffiliateClicks(mappedClicks);
+
+      if (profilesRes.data) {
+        setUsersList(
+          profilesRes.data.map((r: Record<string, unknown>) => ({
+            id: String(r.id),
+            email: String(r.email || ''),
+            fullName: String(r.full_name || ''),
+            avatarUrl: r.avatar_url ? String(r.avatar_url) : undefined,
+            company: r.company ? String(r.company) : undefined,
+            bio: r.bio ? String(r.bio) : undefined,
+            role: r.role === 'admin' ? 'admin' : 'user',
+            createdAt: String(r.created_at || ''),
+          }))
+        );
+      }
+
+      const events = (eventsRes.data || []) as Array<Record<string, unknown>>;
+      const sessions = new Set(events.map((e) => String(e.session_hash || '')));
+      setAnalytics({
+        ...EMPTY_ANALYTICS,
+        totalVisitors: sessions.size,
+        totalPageViews: events.filter((e) => e.event_type === 'page_view').length,
+        totalToolViews: events.filter((e) => e.event_type === 'tool_view').length,
+        totalAffiliateClicks: mappedClicks.length,
+        totalSearches: events.filter((e) => e.event_type === 'search').length,
+        newUserRegistrations: profilesRes.data?.length ?? 0,
+        newsletterSubscriptions: nlRes.data?.length ?? 0,
+        recentClicks: mappedClicks.slice(0, 10),
+      });
+
+      setAdminError(null);
+      return null;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Failed to load admin data.';
+      setAdminError(msg);
+      return msg;
     }
-    setAnalytics(payload.analytics);
-    setAffiliateClicks(payload.affiliateClicks);
-    setSponsoredListings(payload.sponsoredListings);
-    setSubmissions(payload.submissions);
-    setSubscribers(payload.subscribers);
-    setContactInquiries(payload.contactInquiries);
-    setAdvertisingInquiries(payload.advertisingInquiries);
-    setUsersList(payload.users);
-    return null;
-  }, [adminFetch]);
+  }, []);
 
   const syncStarterToolsToSupabase = useCallback(async (): Promise<boolean> => {
-    const res = await adminFetch('/api/admin/tools/sync-starter', {
-      method: 'POST',
-    });
-    if (!res.ok) return false;
-    const payload = res.data as { tools?: AITool[]; count?: number };
-    if (Array.isArray(payload.tools) && payload.tools.length > 0) {
-      setTools(payload.tools);
-      setSupabaseToolsCount(payload.tools.length);
-      await directoryRepository.saveTools(payload.tools);
+    if (!isSupabaseClientConfigured || !supabase) return false;
+    try {
+      const catRows = INITIAL_CATEGORIES.map((c) => ({
+        id: c.id,
+        slug: c.slug,
+        name: c.name,
+        description: c.description,
+        icon_key: c.iconKey,
+        accent_color: c.accentColor,
+      }));
+      const { error: catErr } = await supabase.from('categories').upsert(catRows);
+      if (catErr) {
+        pushToast(`Categories sync error: ${catErr.message}`, 'error');
+        return false;
+      }
+
+      const toolRows = INITIAL_TOOLS.map(serializeToolForSupabase);
+      const { error: toolErr } = await supabase.from('ai_tools').upsert(toolRows);
+      if (toolErr) {
+        pushToast(`Tools sync error: ${toolErr.message}`, 'error');
+        return false;
+      }
+
+      const postRows = INITIAL_BLOG_POSTS.map((p) => ({
+        id: p.id,
+        slug: p.slug,
+        title: p.title,
+        excerpt: p.excerpt,
+        category: p.category,
+        author: p.author,
+        author_role: p.authorRole,
+        published_at: p.publishedAt,
+        read_time_minutes: p.readTimeMinutes,
+        cover_image: p.coverImage,
+        related_tool_slugs: p.relatedToolSlugs || [],
+        sections: p.sections || [],
+        seo_title: p.seoTitle || null,
+        seo_description: p.seoDescription || null,
+        canonical_url: p.canonicalUrl || null,
+        focus_keyword: p.focusKeyword || null,
+      }));
+      await supabase.from('blog_posts').upsert(postRows);
+
+      setSupabaseToolsCount(INITIAL_TOOLS.length);
+      await retryDirectoryLoad();
+      pushToast(`Synced ${INITIAL_TOOLS.length} catalog tools to Supabase.`, 'success');
+      return true;
+    } catch (err) {
+      pushToast(err instanceof Error ? err.message : 'Sync failed.', 'error');
+      return false;
     }
-    pushToast(
-      `Synced ${payload.count ?? payload.tools?.length ?? 0} catalog tools to Supabase.`,
-      'success'
-    );
-    return true;
-  }, [adminFetch, pushToast]);
+  }, [pushToast, retryDirectoryLoad]);
 
   const addTool = useCallback(
     async (
@@ -976,49 +1130,60 @@ export function DirectoryProvider({ children }: { children: React.ReactNode }) {
         reviewCount: 0,
       };
 
-      const res = await adminFetch('/api/admin/tools', {
-        method: 'POST',
-        body: JSON.stringify(created),
-      });
-      if (!res.ok) return null;
+      if (isSupabaseClientConfigured && supabase) {
+        const { error } = await supabase
+          .from('ai_tools')
+          .insert(serializeToolForSupabase(created));
+        if (error) {
+          pushToast(error.message, 'error');
+          return null;
+        }
+      }
 
-      const saved = (res.data as { tool?: AITool }).tool ?? created;
-      const updated = [saved, ...tools.filter((t) => t.id !== saved.id)];
+      const updated = [created, ...tools];
       setTools(updated);
       setSupabaseToolsCount((prev) => (prev === null ? 1 : prev + 1));
       await directoryRepository.saveTools(updated);
-      pushToast(`Added "${saved.name}" to directory.`, 'success');
-      return saved;
+      pushToast(`Added "${created.name}" to directory.`, 'success');
+      return created;
     },
-    [tools, adminFetch, pushToast]
+    [tools, pushToast]
   );
 
   const updateTool = useCallback(
     async (id: string, patch: Partial<AITool>): Promise<boolean> => {
-      const res = await adminFetch(`/api/admin/tools/${encodeURIComponent(id)}`, {
-        method: 'PUT',
-        body: JSON.stringify(patch),
-      });
-      if (!res.ok) return false;
-
-      const saved = (res.data as { tool?: AITool }).tool;
-      const updated = tools.map((t) => (t.id === id ? (saved ?? { ...t, ...patch }) : t));
+      const existing = tools.find((t) => t.id === id);
+      if (!existing) return false;
+      const merged = { ...existing, ...patch };
+      if (isSupabaseClientConfigured && supabase) {
+        const { error } = await supabase
+          .from('ai_tools')
+          .update(serializeToolForSupabase(merged))
+          .eq('id', id);
+        if (error) {
+          pushToast(error.message, 'error');
+          return false;
+        }
+      }
+      const updated = tools.map((t) => (t.id === id ? merged : t));
       setTools(updated);
       await directoryRepository.saveTools(updated);
-      pushToast(`Updated "${saved?.name ?? 'tool'}".`, 'success');
+      pushToast(`Updated "${merged.name}".`, 'success');
       return true;
     },
-    [tools, adminFetch, pushToast]
+    [tools, pushToast]
   );
 
   const deleteTool = useCallback(
     async (id: string): Promise<boolean> => {
       const target = tools.find((t) => t.id === id);
-      const res = await adminFetch(`/api/admin/tools/${encodeURIComponent(id)}`, {
-        method: 'DELETE',
-      });
-      if (!res.ok) return false;
-
+      if (isSupabaseClientConfigured && supabase) {
+        const { error } = await supabase.from('ai_tools').delete().eq('id', id);
+        if (error) {
+          pushToast(error.message, 'error');
+          return false;
+        }
+      }
       const updated = tools.filter((t) => t.id !== id);
       setTools(updated);
       setSupabaseToolsCount((prev) => (prev === null ? null : Math.max(0, prev - 1)));
@@ -1027,7 +1192,7 @@ export function DirectoryProvider({ children }: { children: React.ReactNode }) {
       if (target) pushToast(`Deleted "${target.name}".`, 'info');
       return true;
     },
-    [tools, adminFetch, pushToast]
+    [tools, pushToast]
   );
 
   const addCategory = useCallback(
@@ -1037,52 +1202,71 @@ export function DirectoryProvider({ children }: { children: React.ReactNode }) {
         id: `cat-${Date.now()}`,
         slug: slugify(cat.name),
       };
-      const res = await adminFetch('/api/admin/categories', {
-        method: 'POST',
-        body: JSON.stringify(created),
-      });
-      if (!res.ok) return false;
-
+      if (isSupabaseClientConfigured && supabase) {
+        const { error } = await supabase.from('categories').insert({
+          id: created.id,
+          slug: created.slug,
+          name: created.name,
+          description: created.description,
+          icon_key: created.iconKey,
+          accent_color: created.accentColor,
+        });
+        if (error) {
+          pushToast(error.message, 'error');
+          return false;
+        }
+      }
       const updated = [...categories, created];
       setCategories(updated);
       await directoryRepository.saveCategories(updated);
       pushToast(`Added category "${created.name}".`, 'success');
       return true;
     },
-    [categories, adminFetch, pushToast]
+    [categories, pushToast]
   );
 
   const updateCategory = useCallback(
     async (id: string, patch: Partial<CategoryInfo>): Promise<boolean> => {
-      const res = await adminFetch(`/api/admin/categories/${encodeURIComponent(id)}`, {
-        method: 'PUT',
-        body: JSON.stringify(patch),
-      });
-      if (!res.ok) return false;
-
+      if (isSupabaseClientConfigured && supabase) {
+        const { error } = await supabase
+          .from('categories')
+          .update({
+            ...(patch.name ? { name: patch.name, slug: slugify(patch.name) } : {}),
+            ...(patch.description !== undefined ? { description: patch.description } : {}),
+            ...(patch.iconKey ? { icon_key: patch.iconKey } : {}),
+            ...(patch.accentColor ? { accent_color: patch.accentColor } : {}),
+          })
+          .eq('id', id);
+        if (error) {
+          pushToast(error.message, 'error');
+          return false;
+        }
+      }
       const updated = categories.map((c) => (c.id === id ? { ...c, ...patch } : c));
       setCategories(updated);
       await directoryRepository.saveCategories(updated);
       pushToast('Category updated.', 'success');
       return true;
     },
-    [categories, adminFetch, pushToast]
+    [categories, pushToast]
   );
 
   const deleteCategory = useCallback(
     async (id: string): Promise<boolean> => {
-      const res = await adminFetch(`/api/admin/categories/${encodeURIComponent(id)}`, {
-        method: 'DELETE',
-      });
-      if (!res.ok) return false;
-
+      if (isSupabaseClientConfigured && supabase) {
+        const { error } = await supabase.from('categories').delete().eq('id', id);
+        if (error) {
+          pushToast(error.message, 'error');
+          return false;
+        }
+      }
       const updated = categories.filter((c) => c.id !== id);
       setCategories(updated);
       await directoryRepository.saveCategories(updated);
       pushToast('Category removed.', 'info');
       return true;
     },
-    [categories, adminFetch, pushToast]
+    [categories, pushToast]
   );
 
   const addBlogPost = useCallback(
@@ -1093,52 +1277,81 @@ export function DirectoryProvider({ children }: { children: React.ReactNode }) {
         slug: slugify(post.title) || `post-${Date.now()}`,
         publishedAt: new Date().toISOString().slice(0, 10),
       };
-      const res = await adminFetch('/api/admin/blog', {
-        method: 'POST',
-        body: JSON.stringify(created),
-      });
-      if (!res.ok) return false;
-
+      if (isSupabaseClientConfigured && supabase) {
+        const { error } = await supabase.from('blog_posts').insert({
+          id: created.id,
+          slug: created.slug,
+          title: created.title,
+          excerpt: created.excerpt,
+          category: created.category,
+          author: created.author,
+          author_role: created.authorRole,
+          published_at: created.publishedAt,
+          read_time_minutes: created.readTimeMinutes,
+          cover_image: created.coverImage,
+          related_tool_slugs: created.relatedToolSlugs || [],
+          sections: created.sections || [],
+          seo_title: created.seoTitle || null,
+          seo_description: created.seoDescription || null,
+          canonical_url: created.canonicalUrl || null,
+          focus_keyword: created.focusKeyword || null,
+        });
+        if (error) {
+          pushToast(error.message, 'error');
+          return false;
+        }
+      }
       const updated = [created, ...blogPosts];
       setBlogPosts(updated);
       await directoryRepository.saveBlogPosts(updated);
       pushToast(`Published "${created.title}".`, 'success');
       return true;
     },
-    [blogPosts, adminFetch, pushToast]
+    [blogPosts, pushToast]
   );
 
   const updateBlogPost = useCallback(
     async (id: string, patch: Partial<BlogPost>): Promise<boolean> => {
-      const res = await adminFetch(`/api/admin/blog/${encodeURIComponent(id)}`, {
-        method: 'PUT',
-        body: JSON.stringify(patch),
-      });
-      if (!res.ok) return false;
-
+      if (isSupabaseClientConfigured && supabase) {
+        const { error } = await supabase
+          .from('blog_posts')
+          .update({
+            ...(patch.title ? { title: patch.title } : {}),
+            ...(patch.excerpt !== undefined ? { excerpt: patch.excerpt } : {}),
+            ...(patch.category ? { category: patch.category } : {}),
+            ...(patch.sections ? { sections: patch.sections } : {}),
+          })
+          .eq('id', id);
+        if (error) {
+          pushToast(error.message, 'error');
+          return false;
+        }
+      }
       const updated = blogPosts.map((p) => (p.id === id ? { ...p, ...patch } : p));
       setBlogPosts(updated);
       await directoryRepository.saveBlogPosts(updated);
       pushToast('Article updated.', 'success');
       return true;
     },
-    [blogPosts, adminFetch, pushToast]
+    [blogPosts, pushToast]
   );
 
   const deleteBlogPost = useCallback(
     async (id: string): Promise<boolean> => {
-      const res = await adminFetch(`/api/admin/blog/${encodeURIComponent(id)}`, {
-        method: 'DELETE',
-      });
-      if (!res.ok) return false;
-
+      if (isSupabaseClientConfigured && supabase) {
+        const { error } = await supabase.from('blog_posts').delete().eq('id', id);
+        if (error) {
+          pushToast(error.message, 'error');
+          return false;
+        }
+      }
       const updated = blogPosts.filter((p) => p.id !== id);
       setBlogPosts(updated);
       await directoryRepository.saveBlogPosts(updated);
       pushToast('Article deleted.', 'info');
       return true;
     },
-    [blogPosts, adminFetch, pushToast]
+    [blogPosts, pushToast]
   );
 
   const approveSubmission = useCallback(
@@ -1160,9 +1373,7 @@ export function DirectoryProvider({ children }: { children: React.ReactNode }) {
         websiteUrl: submission.websiteUrl,
         listingTier: submission.requestedTier || 'Free',
         sponsorStatus:
-          submission.requestedTier && submission.requestedTier !== 'Free'
-            ? 'approved'
-            : 'none',
+          submission.requestedTier && submission.requestedTier !== 'Free' ? 'approved' : 'none',
         logoColor: '#4F46E5',
         logoKey: slugify(submission.name),
         features: [],
@@ -1170,18 +1381,16 @@ export function DirectoryProvider({ children }: { children: React.ReactNode }) {
         cons: [],
         bestUseCases: [],
         isFeatured:
-          submission.requestedTier === 'Featured' ||
-          submission.requestedTier === 'Sponsored',
+          submission.requestedTier === 'Featured' || submission.requestedTier === 'Sponsored',
         isTrending: false,
         tags: [slugify(normalizedCategory)],
       });
 
       if (!created) return false;
 
-      await adminFetch(`/api/admin/submissions/${encodeURIComponent(id)}/decision`, {
-        method: 'POST',
-        body: JSON.stringify({ decision: 'approved' }),
-      });
+      if (isSupabaseClientConfigured && supabase) {
+        await supabase.from('tool_submissions').update({ status: 'approved' }).eq('id', id);
+      }
 
       const updatedSubs = submissions.map((s) =>
         s.id === id ? { ...s, status: 'approved' as const } : s
@@ -1190,17 +1399,21 @@ export function DirectoryProvider({ children }: { children: React.ReactNode }) {
       await directoryRepository.saveSubmissions(updatedSubs);
       return true;
     },
-    [submissions, addTool, adminFetch]
+    [submissions, addTool]
   );
 
   const rejectSubmission = useCallback(
     async (id: string): Promise<boolean> => {
-      const res = await adminFetch(`/api/admin/submissions/${encodeURIComponent(id)}/decision`, {
-        method: 'POST',
-        body: JSON.stringify({ decision: 'rejected' }),
-      });
-      if (!res.ok) return false;
-
+      if (isSupabaseClientConfigured && supabase) {
+        const { error } = await supabase
+          .from('tool_submissions')
+          .update({ status: 'rejected' })
+          .eq('id', id);
+        if (error) {
+          pushToast(error.message, 'error');
+          return false;
+        }
+      }
       const updatedSubs = submissions.map((s) =>
         s.id === id ? { ...s, status: 'rejected' as const } : s
       );
@@ -1209,7 +1422,7 @@ export function DirectoryProvider({ children }: { children: React.ReactNode }) {
       pushToast('Submission marked as rejected.', 'info');
       return true;
     },
-    [submissions, adminFetch, pushToast]
+    [submissions, pushToast]
   );
 
   const decideSponsoredListing = useCallback(
@@ -1218,41 +1431,40 @@ export function DirectoryProvider({ children }: { children: React.ReactNode }) {
       decision: 'approved' | 'rejected' | 'pending',
       notes?: string
     ): Promise<boolean> => {
-      const res = await adminFetch(`/api/admin/sponsored/${encodeURIComponent(id)}/decision`, {
-        method: 'POST',
-        body: JSON.stringify({ decision, notes }),
-      });
-      if (!res.ok) return false;
+      if (isSupabaseClientConfigured && supabase) {
+        const { error } = await supabase
+          .from('sponsored_listings')
+          .update({ status: decision, ...(notes !== undefined ? { admin_notes: notes } : {}) })
+          .eq('id', id);
+        if (error) {
+          pushToast(error.message, 'error');
+          return false;
+        }
+      }
       await refreshAdminData();
-      const loadedTools = await directoryRepository.getTools();
-      setTools(loadedTools);
-      pushToast(
-        decision === 'approved'
-          ? 'Sponsored listing approved and published.'
-          : decision === 'pending'
-            ? 'Sponsored campaign paused for review.'
-            : 'Sponsored listing rejected.',
-        'success'
-      );
+      pushToast(`Sponsored listing marked as ${decision}.`, 'success');
       return true;
     },
-    [adminFetch, refreshAdminData, pushToast]
+    [refreshAdminData, pushToast]
   );
 
   const updateUserRole = useCallback(
     async (userId: string, role: 'user' | 'admin'): Promise<boolean> => {
-      const res = await adminFetch(`/api/admin/users/${encodeURIComponent(userId)}/role`, {
-        method: 'PATCH',
-        body: JSON.stringify({ role }),
-      });
-      if (!res.ok) return false;
-      setUsersList((prev) =>
-        prev.map((u) => (u.id === userId ? { ...u, role } : u))
-      );
+      if (isSupabaseClientConfigured && supabase) {
+        const { error } = await supabase
+          .from('profiles')
+          .update({ role, updated_at: new Date().toISOString() })
+          .eq('id', userId);
+        if (error) {
+          pushToast(error.message, 'error');
+          return false;
+        }
+      }
+      setUsersList((prev) => prev.map((u) => (u.id === userId ? { ...u, role } : u)));
       pushToast(`Updated user role to ${role}.`, 'success');
       return true;
     },
-    [adminFetch, pushToast]
+    [pushToast]
   );
 
   const resetDemoData = useCallback(async () => {
@@ -1421,9 +1633,7 @@ export function DirectoryProvider({ children }: { children: React.ReactNode }) {
     ]
   );
 
-  return (
-    <DirectoryContext.Provider value={value}>{children}</DirectoryContext.Provider>
-  );
+  return <DirectoryContext.Provider value={value}>{children}</DirectoryContext.Provider>;
 }
 
 export function useDirectory(): DirectoryContextValue {
